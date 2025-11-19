@@ -531,7 +531,7 @@ struct choc::ui::WebView::Pimpl
             call<void> (prefs, "setValue:forKey:", getNSNumberBool (true), getNSString ("developerExtrasEnabled"));
 
         delegate = createDelegate();
-        objc_setAssociatedObject (delegate, "choc_webview", (CHOC_OBJC_CAST_BRIDGED id) this, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject (delegate, (void*) sel_registerName ("choc_webview"), (CHOC_OBJC_CAST_BRIDGED id) this, OBJC_ASSOCIATION_ASSIGN);
 
         manager = call<id> (config, "userContentController");
         call<void> (manager, "retain");
@@ -545,7 +545,7 @@ struct choc::ui::WebView::Pimpl
         if (! webview)
             return false;
 
-        objc_setAssociatedObject (webview, "choc_webview", (CHOC_OBJC_CAST_BRIDGED id) this, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject (webview, (void*) sel_registerName ("choc_webview"), (CHOC_OBJC_CAST_BRIDGED id) this, OBJC_ASSOCIATION_ASSIGN);
 
         if (! options->customUserAgent.empty())
             call<void> (webview, "setValue:forKey:", getNSString (options->customUserAgent), getNSString ("customUserAgent"));
@@ -573,8 +573,8 @@ struct choc::ui::WebView::Pimpl
     {
         CHOC_AUTORELEASE_BEGIN
         deletionChecker->deleted = true;
-        objc_setAssociatedObject (delegate, "choc_webview", nil, OBJC_ASSOCIATION_ASSIGN);
-        objc_setAssociatedObject (webview, "choc_webview", nil, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject (delegate, (void*) sel_registerName ("choc_webview"), nil, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject (webview, (void*) sel_registerName ("choc_webview"), nil, OBJC_ASSOCIATION_ASSIGN);
         objc::call<void> (webview, "release");
         webview = {};
         objc::call<void> (manager, "removeScriptMessageHandlerForName:", objc::getNSString ("external"));
@@ -827,7 +827,7 @@ private:
 
     static Pimpl* getPimpl (id self)
     {
-        return (CHOC_OBJC_CAST_BRIDGED Pimpl*) (objc_getAssociatedObject (self, "choc_webview"));
+        return (CHOC_OBJC_CAST_BRIDGED Pimpl*) (objc_getAssociatedObject (self, (void*) sel_registerName ("choc_webview")));
     }
 
     WebView& owner;
