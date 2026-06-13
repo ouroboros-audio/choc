@@ -19,10 +19,12 @@
 #ifndef CHOC_WEBVIEW_HEADER_INCLUDED
 #define CHOC_WEBVIEW_HEADER_INCLUDED
 
+#include <atomic>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <vector>
-#include <functional>
 #include "../platform/choc_Platform.h"
 #include "../text/choc_JSON.h"
 
@@ -197,15 +199,46 @@ public:
 
 private:
     //==============================================================================
-    struct Pimpl;
-    std::unique_ptr<Pimpl> pimpl;
+  struct Pimpl;
+  std::unique_ptr<Pimpl> pimpl;
 
-    std::unordered_map<std::string, CallbackFn> bindings;
-    void invokeBinding (const std::string&);
-    static std::string getURIScheme (const Options&);
-    static std::string getURIHome (const Options&);
-    struct DeletionChecker { bool deleted = false; };
+  std::unordered_map<std::string, CallbackFn> bindings;
+  void invokeBinding (const std::string&);
+  static std::string getURIScheme (const Options&);
+  static std::string getURIHome (const Options&);
+  struct DeletionChecker { bool deleted = false; };
 };
+
+namespace detail
+{
+    inline std::atomic<bool>*& resourceCancellationFlagSlot()
+    {
+        thread_local std::atomic<bool>* flag = nullptr;
+        return flag;
+    }
+
+    struct ScopedResourceCancellation
+    {
+        explicit ScopedResourceCancellation(std::atomic<bool>* flag)
+            : previous(resourceCancellationFlagSlot())
+        {
+            resourceCancellationFlagSlot() = flag;
+        }
+
+        ~ScopedResourceCancellation()
+        {
+            resourceCancellationFlagSlot() = previous;
+        }
+
+        std::atomic<bool>* previous = nullptr;
+    };
+} // namespace detail
+
+inline bool currentResourceRequestCancelled()
+{
+    auto* flag = detail::resourceCancellationFlagSlot();
+    return flag != nullptr && flag->load(std::memory_order_acquire);
+}
 
 
 #ifdef JUCE_GUI_EXTRA_H_INCLUDED
@@ -717,6 +750,30 @@ private:
         using namespace choc::objc;
         CHOC_AUTORELEASE_BEGIN
 
+        auto cancelFlag = std::make_shared<std::atomic<bool>> (false);
+
+        {
+            std::lock_guard<std::mutex> lock (activeTaskMutex);
+            activeTaskCancelFlags[(void*) task] = cancelFlag;
+        }
+
+        choc::ui::detail::ScopedResourceCancellation cancelScope (cancelFlag.get());
+
+        struct TaskCleanup
+        {
+            Pimpl* self;
+            id task;
+
+            ~TaskCleanup()
+            {
+                if (self == nullptr)
+                    return;
+
+                std::lock_guard<std::mutex> lock (self->activeTaskMutex);
+                self->activeTaskCancelFlags.erase ((void*) task);
+            }
+        } cleanup { this, task };
+
         try
         {
             id requestUrl = call<id> (call<id> (task, "request"), "URL");
@@ -734,9 +791,21 @@ private:
 
             auto path = objc::getString (call<id> (requestUrl, "path"));
 
+            if (choc::ui::currentResourceRequestCancelled())
+            {
+                sendCancellationError (task);
+                return;
+            }
+
             if (auto resource = options->fetchResource (path))
             {
                 const auto& [bytes, mimeType] = *resource;
+
+                if (choc::ui::currentResourceRequestCancelled())
+                {
+                    sendCancellationError (task);
+                    return;
+                }
 
                 auto contentLength = std::to_string (bytes.size());
                 id headerKeys[]    = { getNSString ("Content-Length"), getNSString ("Content-Type"), getNSString ("Cache-Control"), getNSString ("Access-Control-Allow-Origin") };
@@ -755,6 +824,12 @@ private:
                 call<void> (task, "didReceiveResponse:", makeResponse (404, nullptr));
             }
 
+            if (choc::ui::currentResourceRequestCancelled())
+            {
+                sendCancellationError (task);
+                return;
+            }
+
             call<void> (task, "didFinish");
         }
         catch (...)
@@ -768,11 +843,43 @@ private:
         CHOC_AUTORELEASE_END
     }
 
+    void cancelTask (id task)
+    {
+        std::shared_ptr<std::atomic<bool>> flag;
+
+        {
+            std::lock_guard<std::mutex> lock (activeTaskMutex);
+            if (auto it = activeTaskCancelFlags.find ((void*) task); it != activeTaskCancelFlags.end())
+                flag = it->second;
+        }
+
+        if (flag)
+            flag->store (true, std::memory_order_release);
+    }
+
+    void sendCancellationError (id task)
+    {
+        using namespace choc::objc;
+        static constexpr int NSURLErrorCancelled = -999;
+
+        id error = callClass<id> ("NSError", "errorWithDomain:code:userInfo:",
+                                  getNSString ("NSURLErrorDomain"), NSURLErrorCancelled, nullptr);
+
+        call<void> (task, "didFailWithError:", error);
+    }
+
     BOOL sendAppAction (id self, const char* action)
     {
-        objc::call<void> (objc::getSharedNSApplication(), "sendAction:to:from:",
-                          sel_registerName (action), (id) nullptr, self);
-        return true;
+        id target = {};
+
+        if (id window = objc::call<id> (self, "window"))
+            target = objc::call<id> (window, "firstResponder");
+
+        if (target == nil)
+            target = self;
+
+        return objc::call<BOOL> (objc::getSharedNSApplication(), "sendAction:to:from:",
+                                 sel_registerName (action), target, self);
     }
 
     BOOL performKeyEquivalent (id self, id e)
@@ -836,6 +943,8 @@ private:
     std::unique_ptr<Options> options;
     id webview = {}, manager = {}, delegate = {};
     std::string defaultURI;
+    std::mutex activeTaskMutex;
+    std::unordered_map<void*, std::shared_ptr<std::atomic<bool>>> activeTaskCancelFlags;
 
     struct WebviewClass
     {
@@ -913,7 +1022,11 @@ private:
                              }),
                              "v@:@@@");
 
-            class_addMethod (delegateClass, sel_registerName ("webView:stopURLSchemeTask:"), (IMP) (+[](id, SEL, id, id) {}), "v@:@@");
+            class_addMethod (delegateClass, sel_registerName ("webView:stopURLSchemeTask:"), (IMP) (+[](id self, SEL, id, id task)
+            {
+                if (auto p = getPimpl (self))
+                    p->cancelTask (task);
+            }), "v@:@@");
 
             class_addMethod (delegateClass, sel_registerName ("webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:"),
                              (IMP) (+[](id, SEL, id wkwebview, id params, id /*frame*/, void (^completionHandler)(id))
