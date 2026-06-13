@@ -19,12 +19,19 @@
 #ifndef CHOC_WEBVIEW_HEADER_INCLUDED
 #define CHOC_WEBVIEW_HEADER_INCLUDED
 
+#ifndef CHOC_WEBVIEW_ENABLE_DEBUG_TOOLS
+ #define CHOC_WEBVIEW_ENABLE_DEBUG_TOOLS 1
+#endif
+
 #include <atomic>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <vector>
+#include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include "../platform/choc_Platform.h"
 #include "../text/choc_JSON.h"
 
@@ -86,6 +93,9 @@ public:
         /// Optional user-agent string which can be used to override the default. Leave
         // this empty for default behaviour.
         std::string customUserAgent;
+
+        /// Optional extra browser arguments (WebView2 on Windows only).
+        std::string additionalBrowserArguments;
 
         /// On some platforms (e.g. Windows) a newly constructed WebView can't do
         /// anything until the message loop has dispatched a few messages doing setup
@@ -310,6 +320,7 @@ struct choc::ui::WebView::Pimpl
         WebKitSettings* settings = webkit_web_view_get_settings (WEBKIT_WEB_VIEW (webview));
         webkit_settings_set_javascript_can_access_clipboard (settings, true);
 
+#if CHOC_WEBVIEW_ENABLE_DEBUG_TOOLS
         if (options.enableDebugMode)
         {
             webkit_settings_set_enable_write_console_messages_to_stdout (settings, true);
@@ -319,6 +330,7 @@ struct choc::ui::WebView::Pimpl
         if (options.enableDebugInspector)
             if (auto inspector = WEBKIT_WEB_INSPECTOR (webkit_web_view_get_inspector (WEBKIT_WEB_VIEW (webview))))
                 webkit_web_inspector_show (inspector);
+#endif
 
         if (! options.customUserAgent.empty())
             webkit_settings_set_user_agent (settings, options.customUserAgent.c_str());
@@ -554,14 +566,21 @@ struct choc::ui::WebView::Pimpl
         defaultURI = getURIHome (*options);
 
         id config = callClass<id> ("WKWebViewConfiguration", "new");
+        static id sharedProcessPool = callClass<id> ("WKProcessPool", "new");
+        if (sharedProcessPool != nullptr)
+            call<void> (config, "setProcessPool:", sharedProcessPool);
+        if (id dataStore = callClass<id> ("WKWebsiteDataStore", "defaultDataStore"))
+            call<void> (config, "setWebsiteDataStore:", dataStore);
 
         id prefs = call<id> (config, "preferences");
         call<void> (prefs, "setValue:forKey:", getNSNumberBool (true), getNSString ("fullScreenEnabled"));
         call<void> (prefs, "setValue:forKey:", getNSNumberBool (true), getNSString ("DOMPasteAllowed"));
         call<void> (prefs, "setValue:forKey:", getNSNumberBool (true), getNSString ("javaScriptCanAccessClipboard"));
 
+#if CHOC_WEBVIEW_ENABLE_DEBUG_TOOLS
         if (options->enableDebugMode)
             call<void> (prefs, "setValue:forKey:", getNSNumberBool (true), getNSString ("developerExtrasEnabled"));
+#endif
 
         delegate = createDelegate();
         objc_setAssociatedObject (delegate, (void*) sel_registerName ("choc_webview"), (CHOC_OBJC_CAST_BRIDGED id) this, OBJC_ASSOCIATION_ASSIGN);
@@ -1122,6 +1141,7 @@ typedef interface ICoreWebView2 ICoreWebView2;
 typedef interface ICoreWebView2Controller ICoreWebView2Controller;
 typedef interface ICoreWebView2Controller2 ICoreWebView2Controller2;
 typedef interface ICoreWebView2Environment ICoreWebView2Environment;
+typedef interface ICoreWebView2EnvironmentOptions ICoreWebView2EnvironmentOptions;
 typedef interface ICoreWebView2HttpHeadersCollectionIterator ICoreWebView2HttpHeadersCollectionIterator;
 typedef interface ICoreWebView2HttpRequestHeaders ICoreWebView2HttpRequestHeaders;
 typedef interface ICoreWebView2HttpResponseHeaders ICoreWebView2HttpResponseHeaders;
@@ -1153,6 +1173,22 @@ public:
      virtual HRESULT STDMETHODCALLTYPE get_BrowserVersionString(LPWSTR*) = 0;
      virtual HRESULT STDMETHODCALLTYPE add_NewBrowserVersionAvailable(void*, EventRegistrationToken*) = 0;
      virtual HRESULT STDMETHODCALLTYPE remove_NewBrowserVersionAvailable(EventRegistrationToken) = 0;
+};
+
+MIDL_INTERFACE("2fde08a8-1e9a-4766-8c05-95a9ceb9d1c5")
+ICoreWebView2EnvironmentOptions : public IUnknown
+{
+public:
+     virtual HRESULT STDMETHODCALLTYPE get_AdditionalBrowserArguments(LPWSTR*) = 0;
+     virtual HRESULT STDMETHODCALLTYPE put_AdditionalBrowserArguments(LPCWSTR) = 0;
+     virtual HRESULT STDMETHODCALLTYPE get_Language(LPWSTR*) = 0;
+     virtual HRESULT STDMETHODCALLTYPE put_Language(LPCWSTR) = 0;
+     virtual HRESULT STDMETHODCALLTYPE get_TargetCompatibleBrowserVersion(LPWSTR*) = 0;
+     virtual HRESULT STDMETHODCALLTYPE put_TargetCompatibleBrowserVersion(LPCWSTR) = 0;
+     virtual HRESULT STDMETHODCALLTYPE get_AllowSingleSignOnUsingOSPrimaryAccount(BOOL*) = 0;
+     virtual HRESULT STDMETHODCALLTYPE put_AllowSingleSignOnUsingOSPrimaryAccount(BOOL) = 0;
+
+     static IID getIID() { return { 0x2fde08a8, 0x1e9a, 0x4766, { 0x8c, 0x05, 0x95, 0xa9, 0xce, 0xb9, 0xd1, 0xc5 } }; }
 };
 
 MIDL_INTERFACE("0f99a40c-e962-4207-9e92-e3d542eff849")
@@ -1381,7 +1417,7 @@ ICoreWebView2Controller2 : public ICoreWebView2Controller
 
 };
 
-STDAPI CreateCoreWebView2EnvironmentWithOptions(PCWSTR, PCWSTR, void*, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
+STDAPI CreateCoreWebView2EnvironmentWithOptions(PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions*, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
 
 MIDL_INTERFACE("0702fc30-f43b-47bb-ab52-a42cb552ad9f")
 ICoreWebView2HttpHeadersCollectionIterator : public IUnknown
@@ -1493,11 +1529,45 @@ struct WebView::Pimpl
                                                                         webviewDLL.findFunction ("CreateCoreWebView2EnvironmentWithOptions"))
                     {
                         eventHandler = new EventHandler (*this);
-                        createCoreWebView2EnvironmentWithOptions (nullptr, userDataFolder.c_str(), nullptr, eventHandler);
-                        return true;
+                        if (! options.additionalBrowserArguments.empty())
+                        {
+                            environmentOptions = new EnvironmentOptions (createUTF16StringFromUTF8 (options.additionalBrowserArguments));
+                            environmentOptions->Release();
+                        }
+                        auto startEnvironment = [&] (ICoreWebView2EnvironmentOptions* optionsToUse, const char* label) -> HRESULT
+                        {
+                            const auto hr = createCoreWebView2EnvironmentWithOptions (nullptr, userDataFolder.c_str(), optionsToUse, eventHandler);
+                            if (hr != S_OK)
+                                logWebView2Message (std::string ("WebView2 CreateCoreWebView2EnvironmentWithOptions failed") + label + ": " + getMessageFromHRESULT (hr));
+                            else
+                                logWebView2Message (std::string ("WebView2 CreateCoreWebView2EnvironmentWithOptions started") + label);
+                            return hr;
+                        };
+
+                        auto hr = startEnvironment (environmentOptions.get(), environmentOptions ? " with additional browser arguments" : "");
+                        if (hr != S_OK && environmentOptions)
+                        {
+                            logWebView2Message ("WebView2 retrying without additional browser arguments");
+                            environmentOptions.reset();
+                            hr = startEnvironment (nullptr, " without additional browser arguments");
+                        }
+                        return hr == S_OK;
                     }
+                    logWebView2Message ("WebView2 init failed: CreateCoreWebView2EnvironmentWithOptions not found");
+                }
+                else
+                {
+                    logWebView2Message ("WebView2 init failed: user data folder empty");
                 }
             }
+            else
+            {
+                logWebView2Message ("WebView2 init failed: host window creation failed");
+            }
+        }
+        else
+        {
+            logWebView2Message ("WebView2 init failed: WebView2Loader.dll unavailable");
         }
 
         return false;
@@ -1562,6 +1632,8 @@ struct WebView::Pimpl
     }
 
 private:
+    struct EnvironmentOptions;
+
     WindowClass windowClass { L"CHOCWebView", (WNDPROC) wndProc };
     HWNDHolder hwnd;
     std::string defaultURI, setHTMLURI;
@@ -1605,7 +1677,11 @@ private:
         if (coreWebView->get_Settings (settings.getAddress()) == S_OK
              && settings != nullptr)
         {
+#if CHOC_WEBVIEW_ENABLE_DEBUG_TOOLS
             settings->put_AreDevToolsEnabled (options.enableDebugMode);
+#else
+            settings->put_AreDevToolsEnabled (false);
+#endif
 
             if (! options.customUserAgent.empty())
             {
@@ -1649,10 +1725,21 @@ private:
         void reset()                { if (object) { object->Release(); object = {}; } }
         operator Type*() const      { return object; }
         Type* operator->() const    { return object; }
+        Type* get() const           { return object; }
         Type** getAddress()         { return std::addressof (object); }
 
         Type* object = nullptr;
     };
+
+    static void logWebView2Message (const std::string& message)
+    {
+        const char* path = std::getenv ("ATHANOR_WEBVIEW_CHOC_LOG_PATH");
+        if (path == nullptr || path[0] == '\0')
+            return;
+        std::ofstream out (path, std::ios::app);
+        if (out.is_open())
+            out << "CHOC: " << message << '\n';
+    }
 
     static std::string getMessageFromHRESULT (HRESULT hr)
     {
@@ -1812,33 +1899,51 @@ private:
         ULONG STDMETHODCALLTYPE AddRef() override     { return ++refCount; }
         ULONG STDMETHODCALLTYPE Release() override    { auto newCount = --refCount; if (newCount == 0) delete this; return newCount; }
 
-        HRESULT STDMETHODCALLTYPE Invoke (HRESULT, ICoreWebView2Environment* env) override
+        HRESULT STDMETHODCALLTYPE Invoke (HRESULT result, ICoreWebView2Environment* env) override
         {
+            if (result != S_OK)
+                logWebView2Message ("WebView2 environment callback failed: " + Pimpl::getMessageFromHRESULT (result));
             if (env == nullptr || deletionCheckerRef->deleted)
+            {
+                if (env == nullptr)
+                    logWebView2Message ("WebView2 environment callback: env is null");
                 return E_FAIL;
+            }
 
             if (! ownerPimpl.environmentCreationComplete (env))
                 return E_FAIL;
 
-            env->CreateCoreWebView2Controller (ownerPimpl.hwnd, this);
-            return S_OK;
+            const auto hr = env->CreateCoreWebView2Controller (ownerPimpl.hwnd, this);
+            if (hr != S_OK)
+                logWebView2Message ("WebView2 CreateCoreWebView2Controller failed: " + Pimpl::getMessageFromHRESULT (hr));
+            return hr == S_OK ? S_OK : E_FAIL;
         }
 
-        HRESULT STDMETHODCALLTYPE Invoke (HRESULT, ICoreWebView2Controller* controller) override
+        HRESULT STDMETHODCALLTYPE Invoke (HRESULT result, ICoreWebView2Controller* controller) override
         {
+            if (result != S_OK)
+                logWebView2Message ("WebView2 controller callback failed: " + Pimpl::getMessageFromHRESULT (result));
             if (controller == nullptr || deletionCheckerRef->deleted)
+            {
+                if (controller == nullptr)
+                    logWebView2Message ("WebView2 controller callback: controller is null");
                 return E_FAIL;
+            }
 
             ICoreWebView2* view = {};
             controller->get_CoreWebView2 (std::addressof (view));
 
             if (view == nullptr)
+            {
+                logWebView2Message ("WebView2 controller callback: view is null");
                 return E_FAIL;
+            }
 
             EventRegistrationToken token;
             view->add_WebMessageReceived (this, std::addressof (token));
             view->add_PermissionRequested (this, std::addressof (token));
             ownerPimpl.webviewControllerCreationComplete (controller, view);
+            logWebView2Message ("WebView2 controller ready");
             return S_OK;
         }
 
@@ -1875,8 +1980,114 @@ private:
         }
 
         Pimpl& ownerPimpl;
-        std::atomic<ULONG> refCount { 0 };
+        std::atomic<ULONG> refCount { 1 };
         std::shared_ptr<DeletionChecker> deletionCheckerRef;
+    };
+
+    //==============================================================================
+    struct EnvironmentOptions : public ICoreWebView2EnvironmentOptions
+    {
+        explicit EnvironmentOptions (std::wstring args)
+            : additionalBrowserArguments (std::move (args))
+        {
+        }
+
+        HRESULT STDMETHODCALLTYPE QueryInterface (REFIID refID, void** result) override
+        {
+            if (result == nullptr)
+                return E_POINTER;
+
+            if (refID == IID_IUnknown || refID == ICoreWebView2EnvironmentOptions::getIID())
+            {
+                *result = static_cast<ICoreWebView2EnvironmentOptions*> (this);
+                AddRef();
+                return S_OK;
+            }
+
+            *result = nullptr;
+            return E_NOINTERFACE;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override     { return ++refCount; }
+        ULONG STDMETHODCALLTYPE Release() override    { auto newCount = --refCount; if (newCount == 0) delete this; return newCount; }
+
+        HRESULT STDMETHODCALLTYPE get_AdditionalBrowserArguments (LPWSTR* value) override
+        {
+            return copyWideString (additionalBrowserArguments, value);
+        }
+
+        HRESULT STDMETHODCALLTYPE put_AdditionalBrowserArguments (LPCWSTR value) override
+        {
+            assignWideString (additionalBrowserArguments, value);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_Language (LPWSTR* value) override
+        {
+            return copyWideString (language, value);
+        }
+
+        HRESULT STDMETHODCALLTYPE put_Language (LPCWSTR value) override
+        {
+            assignWideString (language, value);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_TargetCompatibleBrowserVersion (LPWSTR* value) override
+        {
+            return copyWideString (targetCompatibleBrowserVersion, value);
+        }
+
+        HRESULT STDMETHODCALLTYPE put_TargetCompatibleBrowserVersion (LPCWSTR value) override
+        {
+            assignWideString (targetCompatibleBrowserVersion, value);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_AllowSingleSignOnUsingOSPrimaryAccount (BOOL* allow) override
+        {
+            if (allow == nullptr)
+                return E_POINTER;
+            *allow = allowSingleSignOnUsingOSPrimaryAccount;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE put_AllowSingleSignOnUsingOSPrimaryAccount (BOOL allow) override
+        {
+            allowSingleSignOnUsingOSPrimaryAccount = allow;
+            return S_OK;
+        }
+
+    private:
+        static void assignWideString (std::wstring& target, LPCWSTR value)
+        {
+            target = value != nullptr ? value : L"";
+        }
+
+        static HRESULT copyWideString (const std::wstring& source, LPWSTR* value)
+        {
+            if (value == nullptr)
+                return E_POINTER;
+
+            const auto bytes = (source.size() + 1) * sizeof (wchar_t);
+            auto* buffer = static_cast<wchar_t*> (CoTaskMemAlloc (bytes));
+
+            if (buffer == nullptr)
+            {
+                *value = nullptr;
+                return E_OUTOFMEMORY;
+            }
+
+            std::memcpy (buffer, source.c_str(), bytes);
+            *value = buffer;
+            return S_OK;
+        }
+
+        std::wstring additionalBrowserArguments;
+        std::wstring language;
+        std::wstring targetCompatibleBrowserVersion;
+        BOOL allowSingleSignOnUsingOSPrimaryAccount = FALSE;
+        std::atomic<ULONG> refCount { 1 };
     };
 
     //==============================================================================
@@ -1933,6 +2144,7 @@ private:
     WebViewDLL webviewDLL;
     Options options;
     COMPtr<EventHandler> eventHandler;
+    COMPtr<EnvironmentOptions> environmentOptions;
     COMPtr<ICoreWebView2Environment> coreWebViewEnvironment;
     COMPtr<ICoreWebView2> coreWebView;
     COMPtr<ICoreWebView2Controller> coreWebViewController;
