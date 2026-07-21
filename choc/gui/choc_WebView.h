@@ -204,6 +204,11 @@ public:
     /// Adds a script to run when the browser loads a page
     bool addInitScript (const std::string& script);
 
+    /// A callback invoked after all init-script registrations queued before this
+    /// call have completed. The argument is false if any registration failed.
+    using InitScriptsReadyHandler = std::function<void(bool)>;
+    void whenInitScriptsReady (InitScriptsReadyHandler handler);
+
     /// Returns a platform-specific handle for this view
     void* getViewHandle() const;
 
@@ -529,6 +534,12 @@ struct choc::ui::WebView::Pimpl
         return false;
     }
 
+    void whenInitScriptsReady (InitScriptsReadyHandler handler)
+    {
+        if (handler)
+            handler (true);
+    }
+
     void invokeCallback (WebKitJavascriptResult* r)
     {
         auto s = jsc_value_to_string (webkit_javascript_result_get_js_value (r));
@@ -659,6 +670,12 @@ struct choc::ui::WebView::Pimpl
 
         CHOC_AUTORELEASE_END
         return false;
+    }
+
+    void whenInitScriptsReady (InitScriptsReadyHandler handler)
+    {
+        if (handler)
+            handler (true);
     }
 
     bool navigate (const std::string& url)
@@ -943,8 +960,14 @@ private:
     void handleError (id error)
     {
         static constexpr int NSURLErrorCancelled = -999;
+        static constexpr int WebKitErrorFrameLoadInterruptedByPolicyChange = 102;
 
-        if (objc::call<int> (error, "code") == NSURLErrorCancelled)
+        const auto errorCode = objc::call<int> (error, "code");
+        const auto errorDomain = objc::getString (objc::call<id> (error, "domain"));
+
+        if (errorCode == NSURLErrorCancelled
+             || (errorCode == WebKitErrorFrameLoadInterruptedByPolicyChange
+                  && errorDomain == "WebKitErrorDomain"))
             return;
 
         setHTML ("<!DOCTYPE html><html><head><title>Error</title></head>"
@@ -1312,6 +1335,13 @@ public:
      virtual HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2*, ICoreWebView2PermissionRequestedEventArgs*) = 0;
 };
 
+MIDL_INTERFACE("b99369f3-9b11-47b5-bc6f-8e7895fcea17")
+ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE Invoke(HRESULT, LPCWSTR) = 0;
+};
+
 MIDL_INTERFACE("76eceacb-0462-4d94-ac83-423a6793775e")
 ICoreWebView2 : public IUnknown
 {
@@ -1340,7 +1370,7 @@ public:
     virtual HRESULT STDMETHODCALLTYPE remove_PermissionRequested(EventRegistrationToken) = 0;
     virtual HRESULT STDMETHODCALLTYPE add_ProcessFailed(void*, EventRegistrationToken*) = 0;
     virtual HRESULT STDMETHODCALLTYPE remove_ProcessFailed(EventRegistrationToken) = 0;
-    virtual HRESULT STDMETHODCALLTYPE AddScriptToExecuteOnDocumentCreated(LPCWSTR, void*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE AddScriptToExecuteOnDocumentCreated(LPCWSTR, ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler*) = 0;
     virtual HRESULT STDMETHODCALLTYPE RemoveScriptToExecuteOnDocumentCreated(LPCWSTR) = 0;
     virtual HRESULT STDMETHODCALLTYPE ExecuteScript(LPCWSTR, void*) = 0;
     virtual HRESULT STDMETHODCALLTYPE CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT, void*, void*) = 0;
@@ -1607,7 +1637,21 @@ struct WebView::Pimpl
         if (! coreWebView)
             return false;
 
-        return coreWebView->AddScriptToExecuteOnDocumentCreated (createUTF16StringFromUTF8 (script).c_str(), nullptr) == S_OK;
+        initScriptRegistrationState->begin();
+        COMPtr<AddInitScriptCompletedCallback> callback (
+            new AddInitScriptCompletedCallback (initScriptRegistrationState));
+        const auto result = coreWebView->AddScriptToExecuteOnDocumentCreated (
+            createUTF16StringFromUTF8 (script).c_str(), callback);
+
+        if (result != S_OK)
+            initScriptRegistrationState->complete (false);
+
+        return result == S_OK;
+    }
+
+    void whenInitScriptsReady (InitScriptsReadyHandler handler)
+    {
+        initScriptRegistrationState->whenReady (std::move (handler));
     }
 
     bool evaluateJavascript (const std::string& script, CompletionHandler&& ch)
@@ -2139,6 +2183,102 @@ private:
         std::atomic<ULONG> refCount { 0 };
     };
 
+    struct InitScriptRegistrationState
+    {
+        void begin()
+        {
+            std::lock_guard<std::mutex> lock (mutex);
+            ++pending;
+        }
+
+        void complete (bool succeeded)
+        {
+            std::vector<InitScriptsReadyHandler> handlers;
+            bool result = false;
+            {
+                std::lock_guard<std::mutex> lock (mutex);
+                allSucceeded = allSucceeded && succeeded;
+                CHOC_ASSERT (pending != 0);
+                if (pending != 0)
+                    --pending;
+
+                if (pending == 0 && ! readyHandlers.empty())
+                {
+                    result = allSucceeded;
+                    allSucceeded = true;
+                    handlers.swap (readyHandlers);
+                }
+            }
+
+            for (auto& handler : handlers)
+                if (handler)
+                    handler (result);
+        }
+
+        void whenReady (InitScriptsReadyHandler handler)
+        {
+            if (! handler)
+                return;
+
+            bool invokeNow = false;
+            bool result = false;
+            {
+                std::lock_guard<std::mutex> lock (mutex);
+                if (pending == 0)
+                {
+                    invokeNow = true;
+                    result = allSucceeded;
+                    allSucceeded = true;
+                }
+                else
+                {
+                    readyHandlers.push_back (std::move (handler));
+                }
+            }
+
+            if (invokeNow)
+                handler (result);
+        }
+
+        std::mutex mutex;
+        size_t pending = 0;
+        bool allSucceeded = true;
+        std::vector<InitScriptsReadyHandler> readyHandlers;
+    };
+
+    struct AddInitScriptCompletedCallback
+        : public ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler
+    {
+        explicit AddInitScriptCompletedCallback (std::shared_ptr<InitScriptRegistrationState> stateToUse)
+            : state (std::move (stateToUse)) {}
+
+        HRESULT STDMETHODCALLTYPE QueryInterface (REFIID refID, void** result) override
+        {
+            if (refID == IID { 0xb99369f3, 0x9b11, 0x47b5, { 0xbc, 0x6f, 0x8e, 0x78, 0x95, 0xfc, 0xea, 0x17 } }
+                || refID == IID_IUnknown)
+            {
+                *result = this;
+                AddRef();
+                return S_OK;
+            }
+
+            *result = nullptr;
+            return E_NOINTERFACE;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override     { return ++refCount; }
+        ULONG STDMETHODCALLTYPE Release() override    { auto newCount = --refCount; if (newCount == 0) delete this; return newCount; }
+
+        HRESULT STDMETHODCALLTYPE Invoke (HRESULT hr, LPCWSTR) override
+        {
+            state->complete (hr == S_OK);
+            return S_OK;
+        }
+
+        std::shared_ptr<InitScriptRegistrationState> state;
+        std::atomic<ULONG> refCount { 0 };
+    };
+
     //==============================================================================
     WebView& owner;
     WebViewDLL webviewDLL;
@@ -2148,6 +2288,8 @@ private:
     COMPtr<ICoreWebView2Environment> coreWebViewEnvironment;
     COMPtr<ICoreWebView2> coreWebView;
     COMPtr<ICoreWebView2Controller> coreWebViewController;
+    std::shared_ptr<InitScriptRegistrationState> initScriptRegistrationState =
+        std::make_shared<InitScriptRegistrationState>();
 
     //==============================================================================
     static std::wstring getUserDataFolder()
@@ -2222,6 +2364,13 @@ inline bool WebView::isReady() const                                 { return pi
 inline bool WebView::navigate (const std::string& url)               { return pimpl != nullptr && pimpl->navigate (url); }
 inline bool WebView::setHTML (const std::string& html)               { return pimpl != nullptr && pimpl->setHTML (html); }
 inline bool WebView::addInitScript (const std::string& script)       { return pimpl != nullptr && pimpl->addInitScript (script); }
+inline void WebView::whenInitScriptsReady (InitScriptsReadyHandler handler)
+{
+    if (pimpl != nullptr)
+        pimpl->whenInitScriptsReady (std::move (handler));
+    else if (handler)
+        handler (false);
+}
 
 inline bool WebView::evaluateJavascript (const std::string& script, CompletionHandler completionHandler)
 {
@@ -2256,14 +2405,12 @@ window["FUNCTION_NAME"] = function()
     auto script = choc::text::replace (scriptTemplate, "FUNCTION_NAME", functionName,
                                                        "INVOKE_BINDING", Pimpl::postMessageFn);
 
-    if (addInitScript (script)
-         && evaluateJavascript (script))
-    {
-        bindings[functionName] = std::move (fn);
-        return true;
-    }
+    if (! addInitScript (script))
+        return false;
 
-    return false;
+    bindings[functionName] = std::move (fn);
+    (void) evaluateJavascript (script);
+    return true;
 }
 
 inline bool WebView::unbind (const std::string& functionName)
