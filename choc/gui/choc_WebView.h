@@ -97,6 +97,18 @@ public:
         /// Optional extra browser arguments (WebView2 on Windows only).
         std::string additionalBrowserArguments;
 
+        struct BackgroundColour
+        {
+            uint8_t red = 0;
+            uint8_t green = 0;
+            uint8_t blue = 0;
+            uint8_t alpha = 255;
+        };
+
+        /// An optional explicit colour for the browser surface before a document
+        /// paints. On Windows this maps to WebView2's DefaultBackgroundColor.
+        std::optional<BackgroundColour> backgroundColour;
+
         /// On some platforms (e.g. Windows) a newly constructed WebView can't do
         /// anything until the message loop has dispatched a few messages doing setup
         /// work - so you should use this callback to be told when that has happened.
@@ -1691,18 +1703,23 @@ private:
         coreWebViewController = controller;
         coreWebView = view;
 
-        if (options.transparentBackground)
+        if (options.transparentBackground || options.backgroundColour.has_value())
         {
             COMPtr<ICoreWebView2Controller2> controller2;
 
             if (controller->QueryInterface (ICoreWebView2Controller2::getIID(), (void**) controller2.getAddress()) == S_OK
                   && controller2 != nullptr)
             {
-                auto colour = detail::getDefaultWindowColour();
-                COREWEBVIEW2_COLOR background { 0xff,
-                                                static_cast<BYTE> (GetRValue (colour)),
-                                                static_cast<BYTE> (GetGValue (colour)),
-                                                static_cast<BYTE> (GetBValue (colour)) };
+                const auto colour = options.backgroundColour.value_or (
+                    WebView::Options::BackgroundColour {
+                        static_cast<uint8_t> (GetRValue (detail::getDefaultWindowColour())),
+                        static_cast<uint8_t> (GetGValue (detail::getDefaultWindowColour())),
+                        static_cast<uint8_t> (GetBValue (detail::getDefaultWindowColour())),
+                        0xff });
+                COREWEBVIEW2_COLOR background { colour.alpha,
+                                                colour.red,
+                                                colour.green,
+                                                colour.blue };
                 controller2->put_DefaultBackgroundColor (background);
             }
         }
