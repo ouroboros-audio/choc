@@ -1700,6 +1700,12 @@ private:
         if (controller == nullptr || view == nullptr)
             return;
 
+        // The controller is created visible and may present its default white
+        // surface when the host HWND was shown while WebView2 initialised
+        // asynchronously. Keep it hidden until its background and bounds match
+        // the host so no unconfigured compositor frame can escape.
+        controller->put_IsVisible (FALSE);
+
         coreWebViewController = controller;
         coreWebView = view;
 
@@ -1758,6 +1764,7 @@ private:
         }
 
         resizeContentToFit();
+        setVisible (IsWindowVisible (hwnd) != FALSE);
 
         if (options.webviewIsReady)
             options.webviewIsReady (owner);
