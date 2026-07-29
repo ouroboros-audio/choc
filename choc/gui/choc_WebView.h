@@ -97,6 +97,11 @@ public:
         /// Optional extra browser arguments (WebView2 on Windows only).
         std::string additionalBrowserArguments;
 
+        /// On Windows, keeps a full-size WebView2 controller staged just outside
+        /// the host's client area. Call releaseInitialPresentation() once the
+        /// first document is ready to be presented.
+        bool deferInitialPresentation = false;
+
         struct BackgroundColour
         {
             uint8_t red = 0;
@@ -144,6 +149,11 @@ public:
         /// `fetch` calls from javascript etc) will all invoke calls to this callback
         /// with the requested path as their argument.
         FetchResource fetchResource;
+
+        /// By default, providing fetchResource causes the WebView to navigate to its
+        /// home URI as soon as the platform view is created. Set this to true when
+        /// the caller needs to finish asynchronous setup before navigating manually.
+        bool deferInitialNavigation = false;
 
         /// If fetchResource is being used to serve custom data, you can choose to
         /// override the default URI scheme by providing a home URI here, e.g. if
@@ -223,6 +233,9 @@ public:
 
     /// Returns a platform-specific handle for this view
     void* getViewHandle() const;
+
+    /// Releases a deferred Windows WebView2 controller for presentation.
+    bool releaseInitialPresentation();
 
 private:
     //==============================================================================
@@ -403,7 +416,8 @@ struct choc::ui::WebView::Pimpl
             };
 
             webkit_web_context_register_uri_scheme (webviewContext, getURIScheme (options).c_str(), onResourceRequested, this, nullptr);
-            navigate ({});
+            if (! options.deferInitialNavigation)
+                navigate ({});
         }
 
         gtk_widget_show_all (webview);
@@ -633,7 +647,7 @@ struct choc::ui::WebView::Pimpl
 
         call<void> (config, "release");
 
-        if (options->fetchResource)
+        if (options->fetchResource && ! options->deferInitialNavigation)
             navigate ({});
 
         CHOC_AUTORELEASE_END
@@ -1619,6 +1633,8 @@ struct WebView::Pimpl
     {
         deletionChecker->deleted = true;
 
+        if (coreWebViewController)
+            coreWebViewController->Close();
         eventHandler.reset();
         coreWebView.reset();
         coreWebViewController.reset();
@@ -1688,6 +1704,8 @@ struct WebView::Pimpl
     }
 
 private:
+    friend class WebView;
+
     struct EnvironmentOptions;
 
     WindowClass windowClass { L"CHOCWebView", (WNDPROC) wndProc };
@@ -1695,7 +1713,39 @@ private:
     std::string defaultURI, setHTMLURI;
     WebView::Options::Resource pageHTML;
 
-    void webviewControllerCreationComplete (ICoreWebView2Controller* controller, ICoreWebView2* view)
+    WebView::Options::BackgroundColour getConfiguredBackgroundColour() const
+    {
+        const auto fallback = detail::getDefaultWindowColour();
+        return options.backgroundColour.value_or (
+            WebView::Options::BackgroundColour {
+                static_cast<uint8_t> (GetRValue (fallback)),
+                static_cast<uint8_t> (GetGValue (fallback)),
+                static_cast<uint8_t> (GetBValue (fallback)),
+                0xff
+            });
+    }
+
+    bool releaseInitialPresentation()
+    {
+        if (! options.deferInitialPresentation)
+            return false;
+
+        if (initialPresentationReleased)
+            return true;
+
+        if (! coreWebViewController)
+            return false;
+
+        const bool shouldMoveFocus = GetFocus() == hwnd.hwnd;
+        initialPresentationReleased = true;
+        resizeContentToFit();
+        if (shouldMoveFocus)
+            moveFocusToWebView();
+        return true;
+    }
+
+    void webviewControllerCreationComplete (ICoreWebView2Controller* controller,
+                                            ICoreWebView2* view)
     {
         if (controller == nullptr || view == nullptr)
             return;
@@ -1716,12 +1766,7 @@ private:
             if (controller->QueryInterface (ICoreWebView2Controller2::getIID(), (void**) controller2.getAddress()) == S_OK
                   && controller2 != nullptr)
             {
-                const auto colour = options.backgroundColour.value_or (
-                    WebView::Options::BackgroundColour {
-                        static_cast<uint8_t> (GetRValue (detail::getDefaultWindowColour())),
-                        static_cast<uint8_t> (GetGValue (detail::getDefaultWindowColour())),
-                        static_cast<uint8_t> (GetBValue (detail::getDefaultWindowColour())),
-                        0xff });
+                const auto colour = getConfiguredBackgroundColour();
                 COREWEBVIEW2_COLOR background { colour.alpha,
                                                 colour.red,
                                                 colour.green,
@@ -1736,7 +1781,7 @@ private:
         EventRegistrationToken token;
         coreWebView->add_WebResourceRequested (eventHandler, std::addressof (token));
 
-        if (options.fetchResource)
+        if (options.fetchResource && ! options.deferInitialNavigation)
             navigate ({});
 
         COMPtr<ICoreWebView2Settings> settings;
@@ -1831,6 +1876,15 @@ private:
 
     static Pimpl* getPimpl (HWND h)     { return (Pimpl*) GetWindowLongPtr (h, GWLP_USERDATA); }
 
+    void moveFocusToWebView()
+    {
+        if (coreWebViewController
+             && (! options.deferInitialPresentation
+                  || initialPresentationReleased))
+            coreWebViewController->MoveFocus (
+                COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    }
+
     static LRESULT wndProc (HWND h, UINT msg, WPARAM wp, LPARAM lp)
     {
         if (msg == WM_SIZE)
@@ -1840,6 +1894,15 @@ private:
         if (msg == WM_SHOWWINDOW)
             if (auto w = getPimpl (h))
                 w->setVisible (wp != 0);
+
+        if (msg == WM_SETFOCUS)
+            if (auto w = getPimpl (h))
+                w->moveFocusToWebView();
+
+        if (msg == WM_MOVE || msg == WM_MOVING || msg == WM_WINDOWPOSCHANGED)
+            if (auto w = getPimpl (h))
+                if (w->coreWebViewController)
+                    w->coreWebViewController->NotifyParentWindowPositionChanged();
 
         if (msg == WM_ERASEBKGND)
         {
@@ -1858,14 +1921,22 @@ private:
 
     void resizeContentToFit()
     {
-        if (coreWebViewController)
+        if (! coreWebViewController)
+            return;
+
+        RECT r {};
+        if (! GetClientRect (hwnd, std::addressof (r)))
+            return;
+
+        if (options.deferInitialPresentation
+             && ! initialPresentationReleased)
         {
-            RECT r;
-            GetWindowRect (hwnd, &r);
-            r.right -= r.left; r.bottom -= r.top;
-            r.left = r.top = 0;
-            coreWebViewController->put_Bounds (r);
+            const auto width = r.right - r.left;
+            r.left = -width - 1;
+            r.right = -1;
         }
+
+        coreWebViewController->put_Bounds (r);
     }
 
     std::optional<WebView::Options::Resource> fetchResourceOrPageHTML (const std::string& uri)
@@ -2312,6 +2383,7 @@ private:
     COMPtr<ICoreWebView2Environment> coreWebViewEnvironment;
     COMPtr<ICoreWebView2> coreWebView;
     COMPtr<ICoreWebView2Controller> coreWebViewController;
+    bool initialPresentationReleased = false;
     std::shared_ptr<InitScriptRegistrationState> initScriptRegistrationState =
         std::make_shared<InitScriptRegistrationState>();
 
@@ -2402,6 +2474,15 @@ inline bool WebView::evaluateJavascript (const std::string& script, CompletionHa
 }
 
 inline void* WebView::getViewHandle() const                          { return pimpl != nullptr ? pimpl->getViewHandle() : nullptr; }
+inline bool WebView::releaseInitialPresentation()
+{
+#if CHOC_WINDOWS
+    return pimpl != nullptr
+        && pimpl->releaseInitialPresentation();
+#else
+    return false;
+#endif
+}
 
 inline bool WebView::bind (const std::string& functionName, CallbackFn&& fn)
 {
