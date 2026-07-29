@@ -1725,6 +1725,21 @@ private:
             });
     }
 
+    void paintConfiguredBackground (HWND target, HDC dc) const
+    {
+        if (dc == nullptr)
+            return;
+
+        RECT bounds {};
+        GetClientRect (target, std::addressof (bounds));
+        const auto colour = getConfiguredBackgroundColour();
+        const auto previous = SetDCBrushColor (
+            dc, RGB (colour.red, colour.green, colour.blue));
+        FillRect (dc, std::addressof (bounds),
+                  reinterpret_cast<HBRUSH> (GetStockObject (DC_BRUSH)));
+        SetDCBrushColor (dc, previous);
+    }
+
     bool releaseInitialPresentation()
     {
         if (! options.deferInitialPresentation)
@@ -1906,7 +1921,10 @@ private:
 
         if (msg == WM_ERASEBKGND)
         {
-            detail::paintWindowBackground (h, reinterpret_cast<HDC> (wp));
+            if (auto w = getPimpl (h))
+                w->paintConfiguredBackground (h, reinterpret_cast<HDC> (wp));
+            else
+                detail::paintWindowBackground (h, reinterpret_cast<HDC> (wp));
             return 1;
         }
 
