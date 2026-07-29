@@ -97,6 +97,10 @@ public:
         /// Optional extra browser arguments (WebView2 on Windows only).
         std::string additionalBrowserArguments;
 
+        /// Optional absolute user-data folder (WebView2 on Windows only). Leave
+        /// empty to use CHOC's host-executable-scoped default.
+        std::string userDataFolder;
+
         /// On Windows, keeps a full-size WebView2 controller staged just outside
         /// the host's client area. Call releaseInitialPresentation() once the
         /// first document is ready to be presented.
@@ -2406,8 +2410,11 @@ private:
         std::make_shared<InitScriptRegistrationState>();
 
     //==============================================================================
-    static std::wstring getUserDataFolder()
+    std::wstring getUserDataFolder() const
     {
+        if (! options.userDataFolder.empty())
+            return createUTF16StringFromUTF8 (options.userDataFolder);
+
         wchar_t currentExePath[MAX_PATH] = {};
         wchar_t dataPath[MAX_PATH] = {};
 
