@@ -1065,6 +1065,10 @@ private:
             class_addMethod (delegateClass, sel_registerName ("userContentController:didReceiveScriptMessage:"),
                              (IMP) (+[](id self, SEL, id, id msg)
                              {
+                                 // Native bindings belong to the product document, never hosted child frames.
+                                 const auto frame = objc::call<id> (msg, "frameInfo");
+                                 if (frame == nullptr || !objc::call<BOOL> (frame, "isMainFrame"))
+                                     return;
                                  if (auto p = getPimpl (self))
                                      p->owner.invokeBinding (objc::getString (objc::call<id> (msg, "body")));
                              }),
