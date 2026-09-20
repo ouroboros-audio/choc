@@ -19,6 +19,10 @@
 #ifndef CHOC_WEBVIEW_HEADER_INCLUDED
 #define CHOC_WEBVIEW_HEADER_INCLUDED
 
+#ifndef CHOC_WEBVIEW_TEXT
+ #define CHOC_WEBVIEW_TEXT(id, fallback) fallback
+#endif
+
 #ifndef CHOC_WEBVIEW_ENABLE_DEBUG_TOOLS
  #define CHOC_WEBVIEW_ENABLE_DEBUG_TOOLS 1
 #endif
@@ -443,7 +447,7 @@ struct choc::ui::WebView::Pimpl
         g_clear_object (&webviewContext);
     }
 
-    static constexpr const char* postMessageFn = "window.webkit.messageHandlers.external.postMessage";
+    static const char* postMessageFn() { return std::string_view (CHOC_WEBVIEW_TEXT (ChocPostMac, "window.webkit.messageHandlers.external.postMessage")).data(); }
 
     bool stillInitialising() const  { return false; }
     void* getViewHandle() const     { return (void*) webview; }
@@ -678,7 +682,7 @@ struct choc::ui::WebView::Pimpl
         CHOC_AUTORELEASE_END
     }
 
-    static constexpr const char* postMessageFn = "window.webkit.messageHandlers.external.postMessage";
+    static const char* postMessageFn() { return std::string_view (CHOC_WEBVIEW_TEXT (ChocPostMac, "window.webkit.messageHandlers.external.postMessage")).data(); }
 
     bool stillInitialising() const  { return false; }
     void* getViewHandle() const     { return (CHOC_OBJC_CAST_BRIDGED void*) webview; }
@@ -1650,7 +1654,7 @@ struct WebView::Pimpl
         hwnd.reset();
     }
 
-    static constexpr const char* postMessageFn = "window.chrome.webview.postMessage";
+    static const char* postMessageFn() { return std::string_view (CHOC_WEBVIEW_TEXT (ChocPostWin, "window.chrome.webview.postMessage")).data(); }
 
     bool stillInitialising() const  { return ! coreWebView; }
     void* getViewHandle() const     { return (void*) hwnd.hwnd; }
@@ -2518,7 +2522,7 @@ inline bool WebView::bind (const std::string& functionName, CallbackFn&& fn)
     if (pimpl == nullptr)
         return false;
 
-    static constexpr std::string_view scriptTemplate = R"((function() {
+    const std::string_view scriptTemplate = CHOC_WEBVIEW_TEXT (ChocBind, R"((function() {
 const fnBinding = window._fnBindings = (window._fnBindings || { messageID: 1 });
 
 window["FUNCTION_NAME"] = function()
@@ -2534,10 +2538,10 @@ window["FUNCTION_NAME"] = function()
   INVOKE_BINDING (args);
   return promise;
 }
-})())";
+})())");
 
-    auto script = choc::text::replace (scriptTemplate, "FUNCTION_NAME", functionName,
-                                                       "INVOKE_BINDING", Pimpl::postMessageFn);
+    auto script = choc::text::replace (scriptTemplate, CHOC_WEBVIEW_TEXT (ChocFunctionPlaceholder, "FUNCTION_NAME"), functionName,
+                                                       CHOC_WEBVIEW_TEXT (ChocInvokePlaceholder, "INVOKE_BINDING"), Pimpl::postMessageFn());
 
     if (! addInitScript (script))
         return false;
@@ -2570,7 +2574,7 @@ inline void WebView::invokeBinding (const std::string& msg)
         if (callbackID == 0 || b == bindings.end())
             return;
 
-        auto callbackItem = "window._fnBindings[" + std::to_string (callbackID) + "]";
+        auto callbackItem = CHOC_WEBVIEW_TEXT (ChocCallback, "window._fnBindings[") + std::to_string (callbackID) + "]";
 
         try
         {
