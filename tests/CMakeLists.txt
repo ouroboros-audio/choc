@@ -142,3 +142,24 @@ install(TARGETS choc_tests)
 
 enable_testing()
 add_test(NAME choc_tests COMMAND choc_tests)
+
+if (WIN32)
+    add_library(choc_message_loop_module_a SHARED choc_MessageLoopModule.cpp)
+    add_library(choc_message_loop_module_b SHARED choc_MessageLoopModule.cpp)
+    add_executable(choc_message_loop_modules_tests choc_MessageLoopModulesTests.cpp)
+
+    foreach(target choc_message_loop_module_a choc_message_loop_module_b choc_message_loop_modules_tests)
+        target_compile_features(${target} PRIVATE cxx_std_20)
+        target_link_libraries(${target} PRIVATE user32)
+        if (MSVC)
+            # Each DLL has its own CRT state, as independently loaded plug-ins do.
+            set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+    endforeach()
+
+    add_test(NAME choc_message_loop_modules
+        COMMAND choc_message_loop_modules_tests
+            $<TARGET_FILE:choc_message_loop_module_a>
+            $<TARGET_FILE:choc_message_loop_module_b>)
+    set_tests_properties(choc_message_loop_modules PROPERTIES TIMEOUT 15)
+endif()

@@ -383,11 +383,13 @@ struct MessageWindow
 {
     MessageWindow()
     {
-        className = "choc_" + std::to_string (rand());
+        className = "choc_" + std::to_string (reinterpret_cast<uintptr_t> (this));
 
         WNDCLASSEXA wc = {};
         wc.cbSize = sizeof (wc);
-        wc.hInstance = GetModuleHandleA (nullptr);
+        GetModuleHandleExA (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR> (&windowProc), &module);
+        wc.hInstance = module;
         wc.lpszClassName = className.c_str();
         wc.lpfnWndProc = windowProc;
 
@@ -400,7 +402,7 @@ struct MessageWindow
     ~MessageWindow()
     {
         DestroyWindow (hwnd);
-        UnregisterClassA (className.c_str(), nullptr);
+        UnregisterClassA (className.c_str(), module);
     }
 
     static LRESULT CALLBACK windowProc (HWND h, UINT message, WPARAM wParam, LPARAM lParam)
@@ -416,6 +418,7 @@ struct MessageWindow
 
     static inline constexpr WPARAM magicWParam = 0xc40cc40c;
 
+    HMODULE module = nullptr;
     HWND hwnd;
     std::string className;
     DWORD threadID = GetCurrentThreadId();
