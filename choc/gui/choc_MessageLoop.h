@@ -24,6 +24,9 @@
 #include <functional>
 #include <mutex>
 #include <chrono>
+#include <atomic>
+#include <unordered_map>
+#include <stdexcept>
 #include "../platform/choc_Platform.h"
 #include "../platform/choc_Assert.h"
 
@@ -52,6 +55,13 @@ namespace choc::messageloop
     /// your application's message thread at the start of your program to make
     /// sure that any threaded calls to postMessage() work correctly.
     void initialise();
+
+    /// Releases this module's native message-loop resources on their owner thread.
+    /// On Windows this stops timers and discards queued callbacks before closing
+    /// the message window. Further posts are discarded until initialise() is called.
+    /// Returns false if called from a different thread. Other platforms have no
+    /// module-owned native window to release.
+    bool shutdown();
 
     /// Synchronously runs the system message loop.
     void run();
@@ -155,6 +165,8 @@ inline void initialise()
     getMainThreadIDRef() = std::this_thread::get_id();
 }
 
+inline bool shutdown() { return true; }
+
 inline void run()
 {
     initialise();
@@ -250,6 +262,8 @@ inline void initialise()
 {
     getMainThreadIDRef() = std::this_thread::get_id();
 }
+
+inline bool shutdown() { return true; }
 
 inline void run()
 {
@@ -401,7 +415,15 @@ struct MessageWindow
 
     ~MessageWindow()
     {
-        DestroyWindow (hwnd);
+        if (hwnd != nullptr)
+        {
+            MSG message {};
+            while (PeekMessageA (&message, hwnd, WM_APP, WM_APP, PM_REMOVE))
+                if (message.wParam == magicWParam)
+                    delete reinterpret_cast<std::function<void()>*> (message.lParam);
+            while (PeekMessageA (&message, hwnd, WM_TIMER, WM_TIMER, PM_REMOVE)) {}
+            DestroyWindow (hwnd);
+        }
         UnregisterClassA (className.c_str(), module);
     }
 
@@ -419,7 +441,7 @@ struct MessageWindow
     static inline constexpr WPARAM magicWParam = 0xc40cc40c;
 
     HMODULE module = nullptr;
-    HWND hwnd;
+    HWND hwnd = nullptr;
     std::string className;
     DWORD threadID = GetCurrentThreadId();
 };
@@ -430,12 +452,52 @@ struct LockedMessageWindow
     std::unique_lock<std::mutex> lock;
 };
 
+struct NativeTimerHandle
+{
+    HWND window = nullptr;
+    std::atomic<UINT_PTR> id { 0 };
+    std::weak_ptr<void> callbackState;
+};
+
+struct SharedMessageWindow
+{
+    ~SharedMessageWindow()
+    {
+        // Explicit shutdown is required before unloading a DLL. This fallback
+        // keeps the state alive while an application's queued owners are freed.
+        accepting = false;
+        closing = true;
+        for (auto& timer : timers)
+        {
+            KillTimer (timer.second->window, timer.second->id);
+            timer.second->id = 0;
+            timer.second->window = nullptr;
+        }
+        timers.clear();
+        window.reset();
+    }
+
+    std::unique_ptr<MessageWindow> window;
+    std::mutex mutex;
+    bool accepting = true;
+    bool closing = false;
+    UINT_PTR nextTimerID = 1;
+    std::unordered_map<UINT_PTR, std::shared_ptr<NativeTimerHandle>> timers;
+};
+
+inline SharedMessageWindow& getMessageWindowState()
+{
+    static SharedMessageWindow shared;
+    return shared;
+}
+
 inline LockedMessageWindow getSharedMessageWindow (bool recreateIfWrongThread = false)
 {
-    static std::unique_ptr<MessageWindow> window;
-    static std::mutex lock;
-
-    std::unique_lock<std::mutex> l (lock);
+    auto& shared = getMessageWindowState();
+    std::unique_lock<std::mutex> l (shared.mutex);
+    if (shared.closing || ! shared.accepting)
+        throw std::runtime_error ("The message loop is closed");
+    auto& window = shared.window;
 
     if (window == nullptr || (recreateIfWrongThread && window->threadID != GetCurrentThreadId()))
         window = std::make_unique<MessageWindow>();
@@ -445,7 +507,44 @@ inline LockedMessageWindow getSharedMessageWindow (bool recreateIfWrongThread = 
 
 inline void initialise()
 {
+    {
+        auto& shared = getMessageWindowState();
+        std::lock_guard<std::mutex> lock (shared.mutex);
+        if (shared.closing)
+            return;
+        shared.accepting = true;
+    }
     getSharedMessageWindow (true);
+}
+
+inline bool shutdown()
+{
+    auto& shared = getMessageWindowState();
+    std::unique_ptr<MessageWindow> closing;
+    {
+        std::lock_guard<std::mutex> lock (shared.mutex);
+        if (shared.closing)
+            return true;
+        if (shared.window != nullptr && shared.window->threadID != GetCurrentThreadId())
+            return false;
+        shared.accepting = false;
+        shared.closing = true;
+        for (auto& timer : shared.timers)
+        {
+            KillTimer (timer.second->window, timer.second->id);
+            timer.second->id = 0;
+            timer.second->window = nullptr;
+        }
+        shared.timers.clear();
+        closing = std::move (shared.window);
+    }
+    // Callback destructors may call back into the message loop.
+    closing.reset();
+    {
+        std::lock_guard<std::mutex> lock (shared.mutex);
+        shared.closing = false;
+    }
+    return true;
 }
 
 inline void run()
@@ -477,13 +576,26 @@ inline void stop()
 
 inline void postMessage (std::function<void()>&& fn)
 {
-    PostMessageA (getSharedMessageWindow().window.hwnd, WM_APP, MessageWindow::magicWParam,
-                  (LPARAM) new std::function<void()> (std::move (fn)));
+    auto callback = std::make_unique<std::function<void()>> (std::move (fn));
+    {
+        auto& shared = getMessageWindowState();
+        std::lock_guard<std::mutex> lock (shared.mutex);
+        if (shared.accepting && ! shared.closing)
+        {
+            if (shared.window == nullptr)
+                shared.window = std::make_unique<MessageWindow>();
+            if (PostMessageA (shared.window->hwnd, WM_APP, MessageWindow::magicWParam,
+                              reinterpret_cast<LPARAM> (callback.get())))
+                callback.release();
+        }
+    }
 }
 
 inline bool callerIsOnMessageThread()
 {
-    return getSharedMessageWindow().window.threadID == GetCurrentThreadId();
+    auto& shared = getMessageWindowState();
+    std::lock_guard<std::mutex> lock (shared.mutex);
+    return shared.window != nullptr && shared.window->threadID == GetCurrentThreadId();
 }
 
 struct Timer::Pimpl
@@ -493,14 +605,38 @@ struct Timer::Pimpl
         sharedState = std::make_shared<SharedState>();
         sharedState->callback = std::move (c);
 
-        sharedState->timerID = SetTimer (getSharedMessageWindow().window.hwnd, reinterpret_cast<UINT_PTR> (this),
-                                         interval, (TIMERPROC) staticCallback);
+        auto& shared = getMessageWindowState();
+        std::lock_guard<std::mutex> lock (shared.mutex);
+        if (shared.accepting && ! shared.closing)
+        {
+            if (shared.window == nullptr)
+                shared.window = std::make_unique<MessageWindow>();
+            auto handle = std::make_shared<NativeTimerHandle>();
+            handle->window = shared.window->hwnd;
+            handle->callbackState = sharedState;
+            sharedState->timer = handle;
+            handle->id = SetTimer (handle->window, shared.nextTimerID++, interval, staticCallback);
+            if (handle->id != 0)
+            {
+                const auto id = handle->id.load();
+                shared.timers.emplace (id, std::move (handle));
+            }
+        }
     }
 
-    static void staticCallback (HWND, UINT, UINT_PTR p, DWORD) noexcept
+    ~Pimpl() { sharedState->killTimer(); }
+
+    static void CALLBACK staticCallback (HWND, UINT, UINT_PTR p, DWORD) noexcept
     {
-        auto state = reinterpret_cast<Pimpl*>(p)->sharedState; // keep a local shared_ptr
-        return state->handleCallback();
+        std::shared_ptr<void> state;
+        {
+            auto& shared = getMessageWindowState();
+            std::lock_guard<std::mutex> lock (shared.mutex);
+            if (auto timer = shared.timers.find (p); timer != shared.timers.end())
+                state = timer->second->callbackState.lock();
+        }
+        if (state != nullptr)
+            std::static_pointer_cast<SharedState> (state)->handleCallback();
     }
 
     struct SharedState  : public std::enable_shared_from_this<SharedState>
@@ -512,10 +648,16 @@ struct Timer::Pimpl
 
         void killTimer()
         {
-            if (timerID != 0)
+            if (timer != nullptr && timer->id.load() != 0)
             {
-                KillTimer (getSharedMessageWindow().window.hwnd, timerID);
-                timerID = 0;
+                auto& shared = getMessageWindowState();
+                std::lock_guard<std::mutex> lock (shared.mutex);
+                if (timer->id != 0)
+                {
+                    KillTimer (timer->window, timer->id);
+                    shared.timers.erase (timer->id);
+                    timer->id = 0;
+                }
             }
         }
 
@@ -526,7 +668,7 @@ struct Timer::Pimpl
         }
 
         Callback callback;
-        UINT_PTR timerID = 0;
+        std::shared_ptr<NativeTimerHandle> timer;
     };
 
     std::shared_ptr<SharedState> sharedState;
